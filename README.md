@@ -70,6 +70,25 @@
 - **2026-09**: 新增网络层重试/退避：`requests.Session` 挂载 `HTTPAdapter` + `urllib3.Retry`（total=3、指数退避 1/2/4s、对 429/5xx 自动重试），降低 CI 网络抖动导致的误报失败；业务 200 响应不受影响。
 
 
+## Cookie 配置及故障处理（2026-10）
+
+推荐为不同域名单独设置 GitHub Actions repository secrets：
+
+- `GLADOS_CLOUD_COOKIES`：仅用于 `glados.cloud`
+- `RAILGUN_INFO_COOKIES`：仅用于 `railgun.info`
+- `GLADOS_COOKIES`：兼容旧版，**只在没有任何域名专用 Secret 时**同时用于两个域名
+
+同一域名有多个账号时，沿用 `cookie1&cookie2` 的分隔方式。仅配置一个域名专用 Secret 时，只运行该域名，不会自动将另一域名或旧版 Cookie 用于缺失的域名。避免在 GitHub 仓库、日志、Issue 或 PR 中公开任何 Cookie。配置变更需在 Settings → Secrets and variables → Actions 中完成；本 PR 不读取或更新任何 Secret。
+
+### 退出码
+
+- 所有已配置任务签到成功或返回“重复签到”时，退出码为 `0`。
+- 任一签到失败、配置缺失或未预期异常时，退出码为 `1`，GitHub Actions 显示失败。
+- 对于服务端返回的“没有权限”或 `No permission`，日志会明确指出该域名的 Secret 名称，不打印 Cookie 和响应体。重新登录相应域名、手动确认签到页可用，再更新对应 Secret。
+- `PUSHDEER_SENDKEY`、`GLADOS_EXCHANGE_PLAN` 仍可选。
+
+本地纯单元测试（不访问签到接口）：`python -m unittest discover -s tests -v`。
+
 ## 问题排查与定位
 - 大家可以通过查询 actions 中的 running checkin 日志快速定位问题，有其他问题提交issue。
 - 若日志出现 `code : 4, message : Automated check-in detected`：这是 GLaDOS 的**设备平台校验**（`reason=device-mismatch`，即签到请求 UA 平台与登录设备平台不一致）。脚本已内置**设备平台自适应**：首次失败时自动读取服务端返回的 `loginDevice` 并切换对应平台 UA 重试，**无需手动配置 User-Agent**；若长期仍失败，请重新登录 glados.cloud 手动签到一次并刷新 cookie。

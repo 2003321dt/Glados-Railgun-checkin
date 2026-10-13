@@ -72,7 +72,7 @@ def log_method(func):
             result = func(self, *args, **kwargs)
             return result
         except Exception as e:
-            logger.error(f"{LogEmoji.COOKIE}[{self.cookie_index}] {LogEmoji.DOMAIN}[{self.domain}] {LogEmoji.ERROR} {method_name} 执行失败: {e}")
+            logger.error(f"{LogEmoji.COOKIE}[{self.cookie_index}] {LogEmoji.DOMAIN}[{self.domain}] {LogEmoji.ERROR} {method_name} 执行失败 ({type(e).__name__})，请检查请求和配置；异常详情未输出以保护凭证。")
 
             DEFAULT_ERRORS = {
                 "checkin": {"status": "签到失败", "points": "0", "message": ""},
@@ -109,6 +109,10 @@ class Config:
 
     """默认域名"""
     DOMAINS = ["glados.cloud", "railgun.info"]
+    DOMAIN_COOKIE_ENVS = {
+        "glados.cloud": "GLADOS_CLOUD_COOKIES",
+        "railgun.info": "RAILGUN_INFO_COOKIES",
+    }
 
     """兑换计划列表"""
     EXCHANGE_PLANS = {
@@ -119,10 +123,18 @@ class Config:
 
     def __init__(self):
         self.push_key: str = ""
-        self.cookies_list: List[str] = []
+        self.cookies_by_domain: Dict[str, List[str]] = {}
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
         self._load_config()
+
+    @staticmethod
+    def _split_cookies(raw: str, secret_name: str) -> List[str]:
+        """解析以 & 分隔的多账号 Cookie；绝不输出原文。"""
+        cookies = [cookie.strip() for cookie in raw.split("&") if cookie.strip()]
+        if not cookies:
+            raise ValueError(f"Secret '{secret_name}' 中未包含有效的 Cookie。")
+        return cookies
 
     def _load_config(self) -> None:
         """加载配置"""
@@ -137,13 +149,35 @@ class Config:
         else:
             self.push_key = push_key_env
 
-        if not raw_cookies_env:
-            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_COOKIES}' 未设置。")
-            self.cookies_list = []
+        # 域名专用 Cookie 优先于旧版共享 Cookie，避免无意跨域发送凭证。
+        raw_domain_cookies = {
+            domain: os.environ.get(secret_name)
+            for domain, secret_name in self.DOMAIN_COOKIE_ENVS.items()
+        }
+        has_domain_config = any(value and value.strip() for value in raw_domain_cookies.values())
+
+        if has_domain_config:
+            if raw_cookies_env and raw_cookies_env.strip():
+                logger.warning(
+                    f"{LogEmoji.WARNING} 检测到域名专用 Cookie，已忽略旧版 {self.ENV_COOKIES}，避免跨域混用。"
+                )
+            for domain, raw in raw_domain_cookies.items():
+                if raw and raw.strip():
+                    self.cookies_by_domain[domain] = self._split_cookies(
+                        raw, self.DOMAIN_COOKIE_ENVS[domain]
+                    )
+        elif raw_cookies_env and raw_cookies_env.strip():
+            cookies = self._split_cookies(raw_cookies_env, self.ENV_COOKIES)
+            self.cookies_by_domain = {domain: list(cookies) for domain in self.DOMAINS}
+            logger.warning(
+                f"{LogEmoji.WARNING} 正在使用旧版共享 {self.ENV_COOKIES}：同一凭证将用于两个域名。"
+                " 建议迁移到域名专用 Secrets。"
+            )
         else:
-            self.cookies_list = [cookie.strip() for cookie in raw_cookies_env.split("&") if cookie.strip()]
-            if not self.cookies_list:
-                raise ValueError(f"环境变量 '{self.ENV_COOKIES}' 已设置，但未包含任何有效的 Cookie。")
+            logger.warning(
+                f"{LogEmoji.WARNING} 未设置 Cookie Secrets（{self.ENV_COOKIES}、"
+                f"{', '.join(self.DOMAIN_COOKIE_ENVS.values())}）。"
+            )
 
         if not exchange_plan_env:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_EXCHANGE_PLAN}' 未设置，将使用默认设置（不自动兑换）。")
@@ -156,11 +190,15 @@ class Config:
                 logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_EXCHANGE_PLAN}' 的值 '{exchange_plan_env}' 无效，将跳过自动兑换。")
                 self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
 
-        logger.info(f"{LogEmoji.INFO} 共加载了 {len(self.cookies_list)} 个 Cookie 用于签到。")
+        total = sum(len(cookies) for cookies in self.cookies_by_domain.values())
+        logger.info(f"{LogEmoji.INFO} 共加载 {total} 个域名签到任务。")
+        for domain in self.DOMAINS:
+            count = len(self.cookies_by_domain.get(domain, []))
+            logger.info(f"{LogEmoji.INFO} {domain}: {count} 个 Cookie（不显示凭证内容）。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if push_key_env else '未设置'}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
 
-        if verbose_env is not None:
+        if verbose_env and verbose_env.strip():
             verbose_env_lower = verbose_env.lower()
             if verbose_env_lower in ["true", "1", "yes", "y"]:
                 self.verbose = True
@@ -272,7 +310,7 @@ class API:
                 return None
 
             if not response.ok:
-                self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，状态码 {response.status_code}。响应内容: {response.text}", force=True)
+                self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，HTTP 状态码 {response.status_code}（已隐藏响应体以保护凭证）。", force=True)
                 return None
             return response
         except requests.exceptions.RequestException as e:
@@ -355,11 +393,33 @@ class API:
             result["points"] = "0"
             result["message"] = message
         else:
-            self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
+            # 权限拒绝是业务响应，不应误报为网络问题。
+            message_text = str(message).lower()
+            auth_markers = ("permission", "unauthorized", "forbidden", "login", "cookie", "token",
+                            "权限", "登录", "认证", "会话", "凭证")
+            auth_denied = code in (401, 403) or (
+                code == -2 and any(marker in message_text for marker in auth_markers)
+            )
+            if auth_denied:
+                secret_name = Config.DOMAIN_COOKIE_ENVS.get(self.domain, Config.ENV_COOKIES)
+                self._log(
+                    "error", LogEmoji.ERROR,
+                    f"签到认证失败 (code={code})：{self.domain} 的登录凭证被拒绝。"
+                    f" 请重新登录该域名并更新 GitHub Secret {secret_name}；"
+                    "不要在日志或 Issue 中粘贴 Cookie。",
+                    force=True,
+                )
+                result["message"] = "认证失败：Cookie 可能失效或与域名不匹配"
+            else:
+                self._log(
+                    "error", LogEmoji.FAIL,
+                    f"签到请求失败 (code={code})；已隐藏服务端消息以保护凭证。",
+                    force=True,
+                )
+                result["message"] = f"签到失败 (code={code})"
             result["code"] = CheckinStatus.FAILURE
             result["status"] = "签到失败"
             result["points"] = "0"
-            result["message"] = message
 
         return result
 
@@ -486,31 +546,37 @@ class Checker:
             logger.info(f"{LogEmoji.COOKIE}[{cookie_idx}] {LogEmoji.DOMAIN}[{domain}] {emoji} {message}")
 
     def checkin_all(self):
-        """执行所有签到任务"""
-        cookie_count = len(self.config.cookies_list)
-        domain_count = len(self.config.DOMAINS)
-        total_tasks = cookie_count * domain_count
-        task_idx = 0
+        """每个域名只使用该域名配置的 Cookie，旧版共享模式除外。"""
+        tasks = [
+            (domain, cookie_idx, cookie)
+            for domain in self.config.DOMAINS
+            for cookie_idx, cookie in enumerate(
+                self.config.cookies_by_domain.get(domain, []), 1
+            )
+        ]
+        total_tasks = len(tasks)
+        logger.info(f"{LogEmoji.INFO} 本次共 {total_tasks} 个域名签到任务。")
 
-        logger.info(f"{LogEmoji.INFO} 共 {cookie_count} 个 Cookie, {domain_count} 个域名, 共 {total_tasks} 个任务")
+        for task_idx, (domain, cookie_idx, cookie) in enumerate(tasks, 1):
+            logger.info(
+                f"{LogEmoji.INFO} ----- 任务 {task_idx}/{total_tasks}: "
+                f"{LogEmoji.COOKIE}[{cookie_idx}] on {LogEmoji.DOMAIN}[{domain}] -----"
+            )
+            result = self._checkin_on_domain(cookie, cookie_idx, domain)
+            self.results.append(result)
 
-        for cookie_idx, cookie in enumerate(self.config.cookies_list, 1):
-            logger.info(f"{LogEmoji.START} ========== 开始处理 Cookie {cookie_idx} ==========")
-
-            for domain in self.config.DOMAINS:
-                task_idx += 1
-                logger.info(f"{LogEmoji.INFO} ----- 任务 {task_idx}/{total_tasks}: {LogEmoji.COOKIE}[{cookie_idx}] on {LogEmoji.DOMAIN}[{domain}] -----")
-
-                result = self._checkin_on_domain(cookie, cookie_idx, domain)
-                self.results.append(result)
-
-                result_message = f"结果: {result.status}"
-                if result.code == CheckinStatus.SUCCESS:
-                    if self.config.verbose:
-                        result_message = f"结果: {result.status}, 获得 {result.points} 积分, 剩余 {result.days}, 总 {result.points_total}, {result.exchange}"
-                    self._log(cookie_idx, domain, LogEmoji.SUCCESS, result_message, force=True)
-                else:
-                    self._log(cookie_idx, domain, LogEmoji.WARNING, result_message, force=True)
+            result_message = f"结果: {result.status}"
+            if result.code == CheckinStatus.SUCCESS:
+                if self.config.verbose:
+                    result_message = (
+                        f"结果: {result.status}, 获得 {result.points} 积分, "
+                        f"剩余 {result.days}, 总 {result.points_total}, {result.exchange}"
+                    )
+                self._log(cookie_idx, domain, LogEmoji.SUCCESS, result_message, force=True)
+            elif result.code == CheckinStatus.REPEAT:
+                self._log(cookie_idx, domain, LogEmoji.REPEAT, result_message, force=True)
+            else:
+                self._log(cookie_idx, domain, LogEmoji.WARNING, result_message, force=True)
 
     def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str) -> CheckinResult:
         result = CheckinResult(cookie_idx, domain)
@@ -583,37 +649,55 @@ class Checker:
 logger = init_logger()
 
 
-def main():
-    """主函数"""
+def main() -> int:
+    """执行签到并返回进程退出码（0 成功/已签到，1 任意失败）。"""
+    config: Optional[Config] = None
+    exit_code = 1
+    title, content = "GLaDOS 签到未执行", ""
+
     try:
-        # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
         config = Config()
 
-        if not config.cookies_list:
-            logger.error(f"{LogEmoji.ERROR} 未找到有效的 Cookie, 退出程序。")
-            title, content = "# 未找到 cookies!", ""
+        if not any(config.cookies_by_domain.values()):
+            logger.error(f"{LogEmoji.ERROR} 未找到有效的 Cookie，签到未执行。")
+            title = "GLaDOS 签到失败：未配置 Cookie"
         else:
-            # 2. 执行签到
             logger.info(f"{LogEmoji.START} 步骤 2: 执行签到")
             checker = Checker(config)
             checker.checkin_all()
 
-            # 3. 格式化结果
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
             title, content, log_content = checker.format_results()
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
-    except Exception as e:
-        logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
-        title, content, log_content = "# 脚本执行出错", str(e), str(e)
+            if checker.results and all(
+                result.code in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT)
+                for result in checker.results
+            ):
+                exit_code = 0
+            else:
+                logger.error(
+                    f"{LogEmoji.ERROR} 本次至少一个签到任务失败，"
+                    "将返回退出码 1，使 GitHub Actions 标记为失败。"
+                )
+    except Exception as exc:
+        # 不回显异常参数；异常文本有时可能包含请求数据或认证信息。
+        logger.error(
+            f"{LogEmoji.ERROR} 主程序出错 ({type(exc).__name__})，"
+            "将返回退出码 1；请检查配置和前面的安全日志。"
+        )
+        title = f"GLaDOS 签到脚本出错 ({type(exc).__name__})"
+        content = "执行失败，详情请查看 GitHub Actions 中经过脱敏的日志。"
 
-    # 4. 发送推送
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    push_service = PushService(config if "config" in locals() else "")
-    push_service.send(title, content)
-    logger.info(f"{LogEmoji.END} 签到完成")
+    if config is not None:
+        PushService(config).send(title, content)
+    else:
+        logger.warning(f"{LogEmoji.WARNING} 配置加载失败，跳过推送。")
+    logger.info(f"{LogEmoji.END} 签到结束 (exit_code={exit_code})")
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
