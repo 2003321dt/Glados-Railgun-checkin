@@ -8,7 +8,8 @@ on:
       - 'README.md'
       - 'imgs/**'
   schedule:
-    - cron: '18 9,12 * * *'
+    # 每天北京时间 08:00（Asia/Shanghai），每日仅一次
+    - cron: '0 8 * * *'
       timezone: 'Asia/Shanghai'
 
 jobs:
